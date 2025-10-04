@@ -1,145 +1,152 @@
-# app/routers/depth.py
-import io, os
-import cv2
-import numpy as np
-import torch
-import torch.nn as nn
+# app/routers/depth_local.py
+import io, os, sys, time
+from pathlib import Path
+from typing import List, Dict, Any
+
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from PIL import Image
+import numpy as np
 import httpx
 
-router = APIRouter(tags=["inference"])
+# Torch imports (CPU)
+import torch
+import torch.nn.functional as F
 
-# ---- Roboflow env ----
-ROBOFLOW_API_KEY = os.getenv("ROBOFLOW_API_KEY")
-ROBOFLOW_MODEL_ID = os.getenv("ROBOFLOW_MODEL_ID")
-ROBOFLOW_MODEL_VERSION = os.getenv("ROBOFLOW_MODEL_VERSION", "1")
+router = APIRouter(tags=["depth_local"])
 
-def rf_url():
-    if not (ROBOFLOW_API_KEY and ROBOFLOW_MODEL_ID):
-        raise HTTPException(500, "Missing Roboflow env")
-    return f"https://detect.roboflow.com/{ROBOFLOW_MODEL_ID}/{ROBOFLOW_MODEL_VERSION}"
+# Local model path (create app/models and ensure write permission)
+MODEL_DIR = Path(os.getenv("MODEL_DIR", "/app/models"))
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+LOCAL_MIDAS_PATH = MODEL_DIR / "midas_small.pt"
 
-# ---- Load MiDaS (small) once
-_midas = None
-_transform = None
+# Utility: load MiDaS (try local state_dict, otherwise torch.hub and save)
+_midas_model = None
+_midas_transform = None
 _device = torch.device("cpu")
 
-def _load_midas():
-    global _midas, _transform
-    if _midas is not None: 
-        return
-    # Small, faster backbone
-    model_type = "MiDaS_small"  # alternatives: DPT_Large / DPT_Hybrid (slower, better)
-    _midas = torch.hub.load("intel-isl/MiDaS", model_type)
-    _midas.eval().to(_device)
-    _transform = torch.hub.load("intel-isl/MiDaS", "transforms").small_transform
+def load_midas(model_path: Path = LOCAL_MIDAS_PATH):
+    global _midas_model, _midas_transform
+    if _midas_model is not None:
+        return _midas_model, _midas_transform
 
-def _infer_depth_pil(img_pil: Image.Image) -> np.ndarray:
-    _load_midas()
-    # to RGB and tensor
+    # Use torch.hub to fetch model architecture and transforms
+    try:
+        # This will ensure code for MiDaS and transforms is available
+        midas_net = torch.hub.load("intel-isl/MiDaS", "MiDaS_small")
+        transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
+        transform = transforms.small_transform
+    except Exception as e:
+        raise RuntimeError(f"Failed to load midas code from torch.hub: {e}")
+
+    # If local weights exist, load them as state_dict (preferred)
+    if model_path.exists():
+        try:
+            state = torch.load(str(model_path), map_location=_device)
+            # For some hub models, returned object is already the model
+            if isinstance(state, dict):
+                midas_net.load_state_dict(state)
+            else:
+                # state may be a full model object
+                midas_net = state
+        except Exception as e:
+            # if local load fails, continue to let hub download weights automatically
+            print("Warning: failed to load local midas weights:", e, file=sys.stderr)
+
+    # If weights not loaded (fresh), let hub handle downloading weights (first-run)
+    # torch.hub.load above already downloaded weights into cache when building model
+    midas_net.eval().to(_device)
+    _midas_model = midas_net
+    _midas_transform = transform
+
+    # Try to save state_dict to model_path for future offline use
+    try:
+        state_dict = _midas_model.state_dict()
+        torch.save(state_dict, str(model_path))
+        print(f"Saved MiDaS weights to {model_path}", file=sys.stderr)
+    except Exception as e:
+        print("Warning: could not save midas weights locally:", e, file=sys.stderr)
+
+    return _midas_model, _midas_transform
+
+def infer_depth_map(img_pil: Image.Image) -> np.ndarray:
+    """
+    Returns a normalized depth map HxW with values in [0,1] where 1 ~ near, 0 ~ far.
+    """
+    model, transform = load_midas()
     img_rgb = img_pil.convert("RGB")
-    input_batch = _transform(img_rgb).to(_device)
+    inp = transform(img_rgb).unsqueeze(0).to(_device)  # shape 1x3xHxW
     with torch.no_grad():
-        prediction = _midas(input_batch)
-        prediction = torch.nn.functional.interpolate(
-            prediction.unsqueeze(1),
-            size=img_rgb.size[::-1],  # (H, W)
-            mode="bicubic",
-            align_corners=False,
-        ).squeeze().cpu().numpy()
-    # MiDaS: higher = *closer* (relative). Normalize for stability.
-    d = prediction.astype(np.float32)
-    d = (d - d.min()) / (d.max() - d.min() + 1e-6)  # 0..1 (1 ~ closest)
-    return d  # HxW in [0,1]
+        pred = model(inp)
+        pred = F.interpolate(pred.unsqueeze(1),
+                             size=img_rgb.size[::-1],  # PIL size = (W,H) -> we pass (H,W)
+                             mode="bicubic",
+                             align_corners=False).squeeze().cpu().numpy()
+    # normalize (0..1)
+    d = pred.astype("float32")
+    d = (d - d.min()) / (d.max() - d.min() + 1e-8)
+    return d  # H x W, values 0..1 (1 = near)
 
-def _bbox_to_tlwh(center_x, center_y, width, height):
-    # Roboflow returns center x/y + w/h
-    left = center_x - width/2.0
-    top  = center_y - height/2.0
-    return int(left), int(top), int(width), int(height)
+def _center_to_tlwh(cx, cy, w, h):
+    l = int(round(cx - w/2.0))
+    t = int(round(cy - h/2.0))
+    return l, t, int(round(w)), int(round(h))
 
-def _median_depth_in_box(depth_map: np.ndarray, box):
-    h, w = depth_map.shape
-    x, y, bw, bh = box
+def _median_in_box(depth_map: np.ndarray, tlwh):
+    H, W = depth_map.shape
+    x, y, bw, bh = tlwh
     x0 = max(0, x); y0 = max(0, y)
-    x1 = min(w, x + bw); y1 = min(h, y + bh)
+    x1 = min(W, x + bw); y1 = min(H, y + bh)
     if x1 <= x0 or y1 <= y0:
         return None
     region = depth_map[y0:y1, x0:x1]
-    if region.size == 0: 
+    if region.size == 0:
         return None
     return float(np.median(region))
 
-def _depth_to_meters(depth_norm: float, scale: float, min_m: float, max_m: float):
-    """
-    Convert normalized depth (1=near, 0=far) to meters.
-    Simple linear mapping: meters = min_m + (1 - depth_norm) * (max_m - min_m)
-    Then apply scale factor for quick tuning.
-    """
-    meters = min_m + (1.0 - depth_norm) * (max_m - min_m)
-    return max(0.05, meters * scale)
+def _norm_to_meters(norm_val: float, min_m: float, max_m: float, scale: float):
+    # Simple linear mapping: norm 1 => min_m (near), norm 0 => max_m (far)
+    if norm_val is None:
+        return None
+    meters = min_m + (1.0 - norm_val) * (max_m - min_m)
+    return max(0.01, meters * scale)
 
-@router.post("/infer_depth")
-async def infer_depth(
+@router.post("/infer_depth_local")
+async def infer_depth_local(
     file: UploadFile = File(...),
-    confidence: float = 0.4,
-    overlap: float = 0.5,
-    # calibration knobs (tweak in requests without redeploy)
     min_m: float = 0.3,
-    max_m: float = 5.0,
+    max_m: float = 6.0,
     scale: float = 1.0,
+    # you can still include detection params if you proxy to other detector here
 ):
-    # Read image
     content = await file.read()
     if not content:
         raise HTTPException(400, "Empty file")
     try:
         img = Image.open(io.BytesIO(content))
     except Exception:
-        raise HTTPException(400, "Unsupported image")
+        raise HTTPException(400, "Cannot open image")
 
-    # 1) Roboflow detections
-    rf_params = {
-        "api_key": ROBOFLOW_API_KEY,
-        "confidence": confidence,
-        "overlap": overlap,
-        "format": "json",
+    # Run local MiDaS depth
+    try:
+        depth_map = infer_depth_map(img)  # HxW normalized
+    except Exception as e:
+        raise HTTPException(500, f"Depth inference error: {e}")
+
+    # If you also want detections: you can run your detector here (Roboflow or local detector).
+    # For demonstration we'll *not* run object detector — we will return full-depth map + example stats.
+    H, W = depth_map.shape
+
+    # Example: compute coarse distance grid for debugging (downsample)
+    small = depth_map[:: max(1, H//64), :: max(1, W//64)]
+    summary = {
+        "H": H, "W": W,
+        "min": float(depth_map.min()), "max": float(depth_map.max()),
+        "median": float(np.median(depth_map)),
+        "grid_shape": small.shape
     }
-    async with httpx.AsyncClient(timeout=45) as client:
-        rf_resp = await client.post(rf_url(), params=rf_params, files={
-            "file": (file.filename or "frame.jpg", content, file.content_type or "image/jpeg")
-        })
-    if rf_resp.status_code != 200:
-        raise HTTPException(rf_resp.status_code, rf_resp.text)
-    rf_json = rf_resp.json()
-    preds = rf_json.get("predictions", [])
-
-    # 2) MiDaS depth
-    depth_map = _infer_depth_pil(img)  # HxW in [0,1]
-
-    # 3) For each detection, sample depth and convert to meters
-    out_dets = []
-    for p in preds:
-        cx = float(p["x"]); cy = float(p["y"])
-        w  = float(p["width"]); h = float(p["height"])
-        tlwh = _bbox_to_tlwh(cx, cy, w, h)
-        dnorm = _median_depth_in_box(depth_map, tlwh)
-        if dnorm is None:
-            meters = None
-        else:
-            meters = _depth_to_meters(dnorm, scale=scale, min_m=min_m, max_m=max_m)
-
-        out_dets.append({
-            "class_id": p.get("class_id", -1),
-            "class_name": p.get("class", "object"),
-            "conf": float(p.get("confidence", 0.0)),
-            "box": { "x": tlwh[0], "y": tlwh[1], "w": tlwh[2], "h": tlwh[3] },
-            "distance_m": meters
-        })
 
     return {
-        "time_ms": 0.0,
-        "detections": out_dets,
-        "image_b64": None
+        "time": time.time(),
+        "depth_summary": summary,
+        # do NOT return the full float array in prod — for debugging only
     }
