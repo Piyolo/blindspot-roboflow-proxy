@@ -1,14 +1,19 @@
+# app/main.py
+import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
-from app.routers import infer, depth_local, depth
+from app.routers import infer  # keep
+# from app.routers import depth_local, depth  # <-- keep code but don't import when disabled
+
+ENABLE_DEPTH = os.getenv("ENABLE_DEPTH", "false").lower() in ("1", "true", "yes")
 
 app = FastAPI(
-    title="BlindSpot Roboflow Proxy",
-    description="Detections + Depth Anything V2 depth",
+    title="BlindSpot Inference API",
+    description="Roboflow Hosted API proxy (depth temporarily disabled).",
     version="1.0.0",
     docs_url="/docs",
-    redoc_url="/redoc"
+    redoc_url="/redoc",
 )
 
 app.add_middleware(
@@ -17,24 +22,26 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
-@app.on_event("startup")
-async def warmup():
-    # try to preload Depth Anything V2 when the container boots
-    try:
-        from app.routers.depth_local import _load_da2
-        _load_da2()
-        print("✅ DAv2 warmup OK", flush=True)
-    except Exception as e:
-        print(f"⚠️ DAv2 warmup failed (will lazy-load on first request): {e}", flush=True)
-
 @app.get("/", include_in_schema=False)
 def root():
     return RedirectResponse(url="/docs")
 
 @app.get("/health", tags=["meta"])
 def health():
-    return {"ok": True}
+    return {"ok": True, "depth_enabled": ENABLE_DEPTH}
 
+# Always mount detections
 app.include_router(infer.router, prefix="/api")
-app.include_router(depth_local.router)   # depth_local already prefixes with /api/...
-app.include_router(depth.router)
+
+# Mount depth only if explicitly enabled
+if ENABLE_DEPTH:
+    from app.routers import depth_local, depth  # import here so it doesn't load otherwise
+    @app.on_event("startup")
+    async def warmup():
+        try:
+            from app.routers.depth_local import _load_midas
+            _load_midas()
+        except Exception as e:
+            print("⚠️ MiDaS warmup failed (will retry on first request):", e, flush=True)
+    app.include_router(depth_local.router)  # /api/depth_info, /api/infer_depth_local
+    app.include_router(depth.router)        # /api/infer_depth
