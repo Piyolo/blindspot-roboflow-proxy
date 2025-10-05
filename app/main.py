@@ -5,7 +5,7 @@ from app.routers import infer, depth_local, depth
 
 app = FastAPI(
     title="BlindSpot Roboflow Proxy",
-    description="Detections + Local MiDaS depth",
+    description="Detections + Depth Anything V2 depth",
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
@@ -21,8 +21,8 @@ app.add_middleware(
 async def warmup():
     # try to preload MiDaS when the container boots
     try:
-        from app.routers.depth_local import _load_midas
-        _load_midas()
+        from app.routers.depth_local import _load_da2
+    _load_da2()
     except Exception as e:
         print("⚠️ MiDaS warmup failed (will retry on first request):", e, flush=True)
 
