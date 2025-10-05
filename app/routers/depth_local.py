@@ -1,10 +1,9 @@
 # app/routers/depth_local.py
-import io, os, sys, time, traceback
-import numpy as np
+import io, sys, time, traceback
 from pathlib import Path
+import numpy as np
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from PIL import Image
-
 import torch
 import torch.nn.functional as F
 
@@ -18,22 +17,23 @@ _transform = None
 _device = torch.device("cpu")
 
 def _load_midas():
-    """Load MiDaS_small from the vendored repo + local weights (no network)."""
+    """Load MiDaS_small from vendored repo + local weights (no network)."""
     global _midas, _transform
     if _midas is not None:
         return
+
     if not VENDOR_DIR.exists():
-        raise RuntimeError(f"MiDaS code not found at {VENDOR_DIR}")
+        raise RuntimeError(f"MiDaS code not found: {VENDOR_DIR}")
     if not WEIGHTS.exists():
-        raise RuntimeError(f"MiDaS weights not found at {WEIGHTS}")
+        raise RuntimeError(f"MiDaS weights not found: {WEIGHTS}")
 
     sys.path.insert(0, str(VENDOR_DIR))
     try:
-        # MiDaS repo can expose small model in either module path depending on commit
+        # Repo layout differs by commit; try both import paths
         try:
             from midas.models.midas_net import MidasNet_small
         except ImportError:
-            from midas.midas_net import MidasNet_small  # fallback on older layout
+            from midas.midas_net import MidasNet_small
 
         from midas.transforms import Resize, NormalizeImage, PrepareForNet
         import torchvision.transforms as T
@@ -51,7 +51,6 @@ def _load_midas():
     model.to(_device).eval()
     _midas = model
 
-    # Standard small transform; upper_bound resizer for CPU speed
     _transform = T.Compose([
         Resize(
             256, 256,
@@ -69,11 +68,8 @@ def _load_midas():
 def _run_depth(pil_image: Image.Image) -> np.ndarray:
     _load_midas()
     img = pil_image.convert("RGB")
-    # transforms.take dict with "image" ndarray -> returns torch-ready CHW float32
-    from torchvision.transforms.functional import to_pil_image  # just to keep import path hot
     data = _transform({"image": np.array(img)})
     inp = torch.from_numpy(data["image"]).unsqueeze(0).to(_device)  # 1xCxHxW
-
     with torch.no_grad():
         pred = _midas(inp)  # 1x1xH'xW'
         pred = F.interpolate(
@@ -82,9 +78,7 @@ def _run_depth(pil_image: Image.Image) -> np.ndarray:
             mode="bicubic",
             align_corners=False
         ).squeeze().cpu().numpy()
-
-    # Normalize to [0,1] (1 == near)
-    d = (pred - pred.min()) / (pred.max() - pred.min() + 1e-8)
+    d = (pred - pred.min()) / (pred.max() - pred.min() + 1e-8)  # [0,1], 1=near
     return d
 
 @router.get("/api/depth_info")
