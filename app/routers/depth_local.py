@@ -18,10 +18,7 @@ _transform = None
 _device = torch.device("cpu")
 
 def _load_midas():
-    """
-    Load MiDaS from the local vendor checkout and local weights file,
-    so no GitHub/torch.hub calls are made at runtime.
-    """
+    """Load MiDaS_small from the vendored repo + local weights (no network)."""
     global _midas, _transform
     if _midas is not None:
         return
@@ -30,13 +27,18 @@ def _load_midas():
     if not WEIGHTS.exists():
         raise RuntimeError(f"MiDaS weights not found at {WEIGHTS}")
 
-    sys.path.insert(0, str(VENDOR_DIR))  # import local MiDaS package
+    sys.path.insert(0, str(VENDOR_DIR))
     try:
-        from midas.models.midas_net import MidasNet_small
+        # MiDaS repo can expose small model in either module path depending on commit
+        try:
+            from midas.models.midas_net import MidasNet_small
+        except ImportError:
+            from midas.midas_net import MidasNet_small  # fallback on older layout
+
         from midas.transforms import Resize, NormalizeImage, PrepareForNet
         import torchvision.transforms as T
     except Exception as e:
-        raise RuntimeError(f"Failed to import local MiDaS: {e}")
+        raise RuntimeError(f"Failed to import MiDaS local modules: {e}")
 
     print("🔹 Loading local MiDaS_small...", flush=True)
     model = MidasNet_small(
@@ -44,15 +46,15 @@ def _load_midas():
         features=64,
         backbone="efficientnet_lite3",
         exportable=True,
-        non_negative=True
+        non_negative=True,
     )
     model.to(_device).eval()
     _midas = model
 
-    # same transform used by MiDaS small
+    # Standard small transform; upper_bound resizer for CPU speed
     _transform = T.Compose([
         Resize(
-            256, 256,  # keep small for CPU; adjust to 384 for a bit more detail
+            256, 256,
             resize_target=None,
             keep_aspect_ratio=True,
             ensure_multiple_of=32,
@@ -67,11 +69,13 @@ def _load_midas():
 def _run_depth(pil_image: Image.Image) -> np.ndarray:
     _load_midas()
     img = pil_image.convert("RGB")
-    inp = _transform({"image": np.array(img)})["image"]  # HxWxC -> CxHxW float32
-    inp = torch.from_numpy(inp).unsqueeze(0).to(_device)
+    # transforms.take dict with "image" ndarray -> returns torch-ready CHW float32
+    from torchvision.transforms.functional import to_pil_image  # just to keep import path hot
+    data = _transform({"image": np.array(img)})
+    inp = torch.from_numpy(data["image"]).unsqueeze(0).to(_device)  # 1xCxHxW
 
     with torch.no_grad():
-        pred = _midas.forward(inp)  # shape: 1x1xH'xW'
+        pred = _midas(inp)  # 1x1xH'xW'
         pred = F.interpolate(
             pred,
             size=(img.height, img.width),
@@ -79,7 +83,7 @@ def _run_depth(pil_image: Image.Image) -> np.ndarray:
             align_corners=False
         ).squeeze().cpu().numpy()
 
-    # Normalize to [0,1] (1 = near)
+    # Normalize to [0,1] (1 == near)
     d = (pred - pred.min()) / (pred.max() - pred.min() + 1e-8)
     return d
 
