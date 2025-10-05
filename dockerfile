@@ -16,7 +16,8 @@ RUN mkdir -p /app/vendor && \
     git clone --depth 1 https://github.com/isl-org/MiDaS.git /app/vendor/MiDaS && \
     mkdir -p /app/models && \
     wget -O /app/models/midas_v21_small-70d6b9c8.pt \
-      https://github.com/isl-org/MiDaS/releases/download/v2_1_small/midas_v21_small-70d6b9c8.pt
+      https://github.com/isl-org/MiDaS/releases/download/v2_1/midas_v21_small-70d6b9c8.pt
+
 
 # app code
 COPY . .
