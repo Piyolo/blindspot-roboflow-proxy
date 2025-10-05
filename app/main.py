@@ -19,19 +19,22 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def warmup():
-    # try to preload MiDaS when the container boots
+    # try to preload Depth Anything V2 when the container boots
     try:
         from app.routers.depth_local import _load_da2
-    _load_da2()
+        _load_da2()
+        print("✅ DAv2 warmup OK", flush=True)
     except Exception as e:
-        print("⚠️ MiDaS warmup failed (will retry on first request):", e, flush=True)
+        print(f"⚠️ DAv2 warmup failed (will lazy-load on first request): {e}", flush=True)
 
 @app.get("/", include_in_schema=False)
-def root(): return RedirectResponse(url="/docs")
+def root():
+    return RedirectResponse(url="/docs")
 
 @app.get("/health", tags=["meta"])
-def health(): return {"ok": True}
+def health():
+    return {"ok": True}
 
 app.include_router(infer.router, prefix="/api")
-app.include_router(depth_local.router)   # note: depth routes already include /api/...
+app.include_router(depth_local.router)   # depth_local already prefixes with /api/...
 app.include_router(depth.router)
