@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
-from app.routers import infer, depth_local
+from app.routers import infer, depth_local, depth
 
 app = FastAPI(
     title="BlindSpot Roboflow Proxy",
@@ -34,3 +34,4 @@ def health(): return {"ok": True}
 
 app.include_router(infer.router, prefix="/api")
 app.include_router(depth_local.router)   # note: depth routes already include /api/...
+app.include_router(depth.router)
