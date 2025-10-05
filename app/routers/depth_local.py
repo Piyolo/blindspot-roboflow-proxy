@@ -1,90 +1,72 @@
 # app/routers/depth_local.py
+"""
+Depth inference router using Depth Anything V2 (replacing MiDaS small).
+
+Endpoints (backward-compatible):
+- GET  /api/depth_info
+- POST /api/infer_depth_local   (multipart form 'file')
+"""
 import io, sys, time, traceback
 from pathlib import Path
+
 import numpy as np
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from PIL import Image
 import torch
-import torch.nn.functional as F
 
 router = APIRouter(tags=["Depth"])
 
-VENDOR_DIR = Path("/app/vendor/MiDaS")
-WEIGHTS = Path("/app/models/midas_v21_small-70d6b9c8.pt")
+# Where the Dockerfile places code/weights
+VENDOR_DIR = Path("/app/vendor/Depth-Anything-V2")
+CHECKPOINT = Path("/app/checkpoints/depth_anything_v2_vits.pth")  # Small (ViT-S)
+ENCODER = "vits"  # 'vits' | 'vitb' | 'vitl'
 
-_midas = None
-_transform = None
-_device = torch.device("cpu")
+_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+_da2 = None
 
-def _load_midas():
-    """Load MiDaS_small from vendored repo + local weights (no network)."""
-    global _midas, _transform
-    if _midas is not None:
+def _load_da2():
+    """Load Depth Anything V2 from vendored repo + local checkpoint."""
+    global _da2
+    if _da2 is not None:
         return
-
     if not VENDOR_DIR.exists():
-        raise RuntimeError(f"MiDaS code not found: {VENDOR_DIR}")
-    if not WEIGHTS.exists():
-        raise RuntimeError(f"MiDaS weights not found: {WEIGHTS}")
+        raise RuntimeError(f"Depth-Anything-V2 code not found at {VENDOR_DIR}")
+    if not CHECKPOINT.exists():
+        raise RuntimeError(f"DAv2 checkpoint not found at {CHECKPOINT}")
 
     sys.path.insert(0, str(VENDOR_DIR))
     try:
-        # Repo layout differs by commit; try both import paths
-        try:
-            from midas.models.midas_net import MidasNet_small
-        except ImportError:
-            from midas.midas_net import MidasNet_small
-
-        from midas.transforms import Resize, NormalizeImage, PrepareForNet
-        import torchvision.transforms as T
+        from depth_anything_v2.dpt import DepthAnythingV2
     except Exception as e:
-        raise RuntimeError(f"Failed to import MiDaS local modules: {e}")
+        raise RuntimeError(f"Failed to import Depth Anything V2 modules: {e}")
 
-    print("🔹 Loading local MiDaS_small...", flush=True)
-    model = MidasNet_small(
-        str(WEIGHTS),
-        features=64,
-        backbone="efficientnet_lite3",
-        exportable=True,
-        non_negative=True,
-    )
-    model.to(_device).eval()
-    _midas = model
+    model_configs = {
+        "vits": {"encoder": "vits", "features": 64,  "out_channels": [48, 96, 192, 384]},
+        "vitb": {"encoder": "vitb", "features": 128, "out_channels": [96, 192, 384, 768]},
+        "vitl": {"encoder": "vitl", "features": 256, "out_channels": [256, 512, 1024, 1024]},
+    }
 
-    _transform = T.Compose([
-        Resize(
-            256, 256,
-            resize_target=None,
-            keep_aspect_ratio=True,
-            ensure_multiple_of=32,
-            resize_method="upper_bound",
-            image_interpolation_method="bicubic",
-        ),
-        NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        PrepareForNet(),
-    ])
-    print("✅ MiDaS_small ready.", flush=True)
+    print("🔹 Loading Depth Anything V2 (small)...", flush=True)
+    model = DepthAnythingV2(**model_configs[ENCODER])
+    state = torch.load(str(CHECKPOINT), map_location="cpu")
+    model.load_state_dict(state)
+    globals()["_da2"] = model.to(_device).eval()
 
 def _run_depth(pil_image: Image.Image) -> np.ndarray:
-    _load_midas()
-    img = pil_image.convert("RGB")
-    data = _transform({"image": np.array(img)})
-    inp = torch.from_numpy(data["image"]).unsqueeze(0).to(_device)  # 1xCxHxW
+    """Run DAv2 and return a [0,1] normalized depth map (1=near)."""
+    _load_da2()
+    # DAv2 expects numpy BGR (OpenCV style). Convert PIL RGB -> BGR.
+    arr = np.array(pil_image.convert("RGB"))[:, :, ::-1].copy()
     with torch.no_grad():
-        pred = _midas(inp)  # 1x1xH'xW'
-        pred = F.interpolate(
-            pred,
-            size=(img.height, img.width),
-            mode="bicubic",
-            align_corners=False
-        ).squeeze().cpu().numpy()
-    d = (pred - pred.min()) / (pred.max() - pred.min() + 1e-8)  # [0,1], 1=near
-    return d
+        depth = _da2.infer_image(arr)  # HxW float numpy
+    depth = depth.astype(np.float32)
+    # normalize like your MiDaS path: near=1, far=0
+    return (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
 
 @router.get("/api/depth_info")
 def depth_info():
     try:
-        _load_midas()
+        _load_da2()
         return {"ok": True, "device": str(_device)}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -100,13 +82,19 @@ async def infer_depth_local(file: UploadFile = File(...)):
     try:
         t0 = time.time()
         depth_map = _run_depth(image)
-        dt = round((time.time() - t0) * 1000, 2)
+        dt_ms = round((time.time() - t0) * 1000.0, 2)
+        H, W = depth_map.shape[:2]
+        small = depth_map[:: max(1, H // 64), :: max(1, W // 64)]
         return {
             "status": "ok",
-            "inference_time_ms": dt,
-            "median_norm_depth": float(np.median(depth_map)),
-            "near_norm_depth": float(np.percentile(depth_map, 90)),
-            "far_norm_depth": float(np.percentile(depth_map, 10)),
+            "inference_time_ms": dt_ms,
+            "depth_summary": {
+                "H": H, "W": W,
+                "min": float(depth_map.min()),
+                "max": float(depth_map.max()),
+                "median": float(np.median(depth_map)),
+                "grid_shape": small.shape,
+            },
         }
     except Exception as e:
         traceback.print_exc()
