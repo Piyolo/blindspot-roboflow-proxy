@@ -1,13 +1,19 @@
 # app/routers/depth_local.py
 """
-Depth inference router using Depth Anything V2 (replacing MiDaS small).
-
-Endpoints (backward-compatible):
-- GET  /api/depth_info
-- POST /api/infer_depth_local   (multipart form 'file')
+Depth inference router using Depth Anything V2 (Render-friendly).
+- Limits CPU threads (avoids OOM/oversubscription on free instances)
+- Bootstraps vendor repo + weights into /var/tmp
+- Downscales images before running depth to keep memory low
+Endpoints:
+  GET  /api/depth_info
+  POST /api/infer_depth_local  (multipart form 'file')
 """
 import io, os, sys, time, traceback, zipfile, urllib.request, shutil
 from pathlib import Path
+
+# ── Keep CPU usage safe on small instances ─────────────────────────────────────
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 import numpy as np
 from fastapi import APIRouter, UploadFile, File, HTTPException
@@ -17,12 +23,15 @@ import torch
 router = APIRouter(tags=["Depth"])
 
 # ── Writable base on Render Native runtime ─────────────────────────────────────
-BASE_DIR   = Path(os.getenv("DA2_BASE_DIR", "/var/tmp/da2"))
-VENDOR_ROOT = BASE_DIR / "vendor"           # will contain an extracted repo
+BASE_DIR    = Path(os.getenv("DA2_BASE_DIR", "/var/tmp/da2"))
+VENDOR_ROOT = BASE_DIR / "vendor"         # contains extracted repo
 CKPT_ROOT   = BASE_DIR / "checkpoints"
 
-# pick encoder via env if needed: vits | vitb | vitl
+# Choose model size via env: vits | vitb | vitl (vits is the lightest)
 ENCODER = os.getenv("DA2_ENCODER", "vits").lower()
+
+# Limit the input resolution to avoid OOM (longest side, pixels)
+MAX_SIDE = int(os.getenv("DA2_MAX_SIDE", "640"))  # 640–768 is reasonable on CPU
 
 # Checkpoint names/URLs
 HF_URLS = {
@@ -39,12 +48,18 @@ CHECKPOINT = CKPT_ROOT / CKPT_NAME
 # Github ZIP (no git needed)
 GITHUB_ZIP = "https://codeload.github.com/DepthAnything/Depth-Anything-V2/zip/refs/heads/main"
 
-# Torch device
+# Torch device and threads
 _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+try:
+    torch.set_num_threads(1)
+except Exception:
+    pass
 
 # Loaded model singleton
 _da2 = None
 _vendor_module_parent = None  # path to put on sys.path
+
+# ───────────────────────────────────────────────────────────────────────────────
 
 def _download(url: str, dst: Path, desc: str):
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -59,21 +74,18 @@ def _ensure_vendor_repo() -> Path:
     Ensures the Depth-Anything-V2 repo is available under VENDOR_ROOT.
     Returns the directory that contains the 'depth_anything_v2' package.
     """
-    # If already extracted, locate the package folder
     if VENDOR_ROOT.exists():
         for p in VENDOR_ROOT.glob("Depth-Anything-V2-*"):
             if (p / "depth_anything_v2").exists():
                 return p
 
-    # Otherwise download+extract
     tmp_zip = BASE_DIR / "tmp" / "da2.zip"
     _download(GITHUB_ZIP, tmp_zip, "Depth-Anything-V2 repo ZIP")
     with zipfile.ZipFile(tmp_zip, "r") as zf:
-        extract_dir = VENDOR_ROOT
-        if extract_dir.exists():
-            shutil.rmtree(extract_dir, ignore_errors=True)
-        extract_dir.mkdir(parents=True, exist_ok=True)
-        zf.extractall(extract_dir)
+        if VENDOR_ROOT.exists():
+            shutil.rmtree(VENDOR_ROOT, ignore_errors=True)
+        VENDOR_ROOT.mkdir(parents=True, exist_ok=True)
+        zf.extractall(VENDOR_ROOT)
 
     for p in VENDOR_ROOT.glob("Depth-Anything-V2-*"):
         if (p / "depth_anything_v2").exists():
@@ -94,7 +106,7 @@ def _load_da2():
         return
 
     vendor_repo_root = _ensure_vendor_repo()
-    _vendor_module_parent = vendor_repo_root  # parent that contains 'depth_anything_v2'
+    _vendor_module_parent = vendor_repo_root
     if str(_vendor_module_parent) not in sys.path:
         sys.path.insert(0, str(_vendor_module_parent))
 
@@ -121,24 +133,35 @@ def _load_da2():
     _da2 = model.to(_device).eval()
     print("✅ DAv2 loaded", flush=True)
 
+def _resize_keep_ar(pil_img: Image.Image, max_side: int) -> Image.Image:
+    w, h = pil_img.size
+    s = max(w, h)
+    if s <= max_side:
+        return pil_img
+    scale = max_side / float(s)
+    new_w, new_h = int(w * scale), int(h * scale)
+    return pil_img.resize((new_w, new_h), Image.BILINEAR)
+
 def _run_depth(pil_image: Image.Image) -> np.ndarray:
     """Run DAv2 and return a [0,1] normalized depth map (1=near)."""
     _load_da2()
 
-    # DAv2 expects ndarray BGR
-    arr = np.array(pil_image.convert("RGB"))[:, :, ::-1].copy()
+    # Downscale aggressively to stay within memory limits
+    img_small = _resize_keep_ar(pil_image.convert("RGB"), MAX_SIDE)
 
-    # Preferred path: use model's helper if available
+    # DAv2 expects ndarray BGR
+    arr = np.array(img_small)[:, :, ::-1].copy()
+
+    # Preferred path: repo usually exposes infer_image(ndarray_bgr)
     try:
         depth = _da2.infer_image(arr)  # HxW float numpy
     except AttributeError:
-        # Fallback: try direct forward (repo usually ships an infer helper; this is a best-effort)
-        # If your repo revision lacks infer_image, we can wire transforms explicitly if needed.
+        # Fallback (if repo revision lacks infer_image, using a minimal forward)
         import torch.nn.functional as F
         x = torch.from_numpy(arr).permute(2,0,1).unsqueeze(0).float() / 255.0
         x = x.to(_device)
         with torch.no_grad():
-            pred = _da2(x)            # may require exact preprocessing in some revisions
+            pred = _da2(x)
         depth = pred.squeeze().detach().cpu().numpy()
 
     depth = depth.astype(np.float32)
@@ -159,6 +182,9 @@ def depth_info():
             "vendor_root": str(VENDOR_ROOT),
             "checkpoint": str(CHECKPOINT),
             "encoder": ENCODER,
+            "max_side": MAX_SIDE,
+            "omp_threads": os.environ.get("OMP_NUM_THREADS"),
+            "mkl_threads": os.environ.get("MKL_NUM_THREADS"),
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -176,7 +202,7 @@ async def infer_depth_local(file: UploadFile = File(...)):
         depth_map = _run_depth(image)
         dt_ms = round((time.time() - t0) * 1000.0, 2)
         H, W = depth_map.shape[:2]
-        # lightweight summary to keep response small like your old MiDaS path
+        # lightweight summary to keep response small
         stride_h = max(1, H // 64)
         stride_w = max(1, W // 64)
         small = depth_map[::stride_h, ::stride_w]
