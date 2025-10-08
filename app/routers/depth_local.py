@@ -1,7 +1,7 @@
 # app/routers/depth_local.py
 """
 Depth inference router using Depth Anything V2 (offline, vendored).
-- Loads code from vendor/Depth-Anything-V2
+- Loads code from vendor/Depth-Anything-V2/depth_anything_v2
 - Loads weights from checkpoints/
 - Limits CPU threads and downscales input to avoid OOM on Render
 Endpoints:
@@ -24,7 +24,7 @@ router = APIRouter(tags=["Depth"])
 
 # Resolve project paths: <project>/app/routers/depth_local.py -> up two levels -> <project>
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-VENDOR_DIR   = PROJECT_ROOT / "vendor" / "Depth-Anything-V2"
+VENDOR_DIR   = PROJECT_ROOT / "vendor" / "Depth-Anything-V2" / "depth_anything_v2"
 CHECKPOINT   = PROJECT_ROOT / "checkpoints" / "depth_anything_v2_vits.pth"
 ENCODER      = os.getenv("DA2_ENCODER", "vits").lower()   # keep 'vits' on CPU
 MAX_SIDE     = int(os.getenv("DA2_MAX_SIDE", "640"))      # downscale longest side
@@ -38,10 +38,16 @@ except Exception:
 _da2 = None
 
 def _assert_layout():
-    if not (VENDOR_DIR / "depth_anything_v2").exists():
-        raise RuntimeError(f"Depth-Anything-V2 package not found at {VENDOR_DIR}/depth_anything_v2")
+    if not VENDOR_DIR.exists():
+        raise RuntimeError(
+            f"Depth-Anything-V2 package not found at {VENDOR_DIR}.\n"
+            f"Upload the *depth_anything_v2* folder here."
+        )
     if not CHECKPOINT.exists():
-        raise RuntimeError(f"Checkpoint not found: {CHECKPOINT} (download happens at build time)")
+        raise RuntimeError(
+            f"Checkpoint not found: {CHECKPOINT}\n"
+            f"It will be downloaded during the Render *build* step."
+        )
 
 def _load_da2():
     global _da2
@@ -51,10 +57,8 @@ def _load_da2():
     _assert_layout()
 
     # import vendored package
-    vend_parent = VENDOR_DIR
-    if str(vend_parent) not in sys.path:
-        sys.path.insert(0, str(vend_parent))
-
+    if str(VENDOR_DIR.parent) not in sys.path:
+        sys.path.insert(0, str(VENDOR_DIR.parent))
     try:
         from depth_anything_v2.dpt import DepthAnythingV2
     except Exception as e:
@@ -69,7 +73,7 @@ def _load_da2():
     if cfg is None:
         raise RuntimeError(f"Unsupported ENCODER '{ENCODER}'")
 
-    print(f"🔹 Loading DAv2 ({ENCODER}) from {VENDOR_DIR}", flush=True)
+    print(f"🔹 Loading DAv2 ({ENCODER}) from {VENDOR_DIR.parent}", flush=True)
     state = torch.load(str(CHECKPOINT), map_location="cpu")
     model = DepthAnythingV2(**cfg)
     model.load_state_dict(state)
@@ -116,7 +120,7 @@ def depth_info():
         return {
             "ok": True,
             "device": str(_device),
-            "vendor_dir": str(VENDOR_DIR),
+            "vendor_dir": str(VENDOR_DIR.parent),
             "checkpoint": str(CHECKPOINT),
             "encoder": ENCODER,
             "max_side": MAX_SIDE,
