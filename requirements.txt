@@ -5,8 +5,10 @@ python-multipart==0.0.9
 Pillow==10.4.0
 numpy==1.26.4
 
-torch==2.3.1
-torchvision==0.18.1
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.3.1+cpu
+torchvision==0.18.1+cpu
+
 timm==0.9.16
 opencv-python-headless==4.10.0.84
 einops==0.7.0
