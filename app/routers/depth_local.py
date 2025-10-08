@@ -1,4 +1,3 @@
-# app/routers/depth_local.py
 import io, os, sys, time, traceback
 from pathlib import Path
 os.environ.setdefault("OMP_NUM_THREADS","1")
@@ -10,11 +9,12 @@ from PIL import Image
 import torch
 
 router = APIRouter(tags=["Depth"])
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 VENDOR_DIR   = PROJECT_ROOT / "vendor" / "Depth-Anything-V2" / "depth_anything_v2"
 CHECKPOINT   = PROJECT_ROOT / "checkpoints" / "depth_anything_v2_vits.pth"
 ENCODER      = os.getenv("DA2_ENCODER","vits").lower()
-MAX_SIDE     = int(os.getenv("DA2_MAX_SIDE","320"))  # ← start at 320 on free tier
+MAX_SIDE     = int(os.getenv("DA2_MAX_SIDE","320"))  # start small on free tier
 
 _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 try: torch.set_num_threads(1)
@@ -31,16 +31,18 @@ def _load_da2():
     global _da2
     if _da2 is not None: return
     _assert_layout()
-    if str(VENDOR_DIR.parent) not in sys.path:
-        sys.path.insert(0, str(VENDOR_DIR.parent))
+    # import vendored package
+    pkg_parent = VENDOR_DIR.parent
+    if str(pkg_parent) not in sys.path:
+        sys.path.insert(0, str(pkg_parent))
     from depth_anything_v2.dpt import DepthAnythingV2
-    cfgs = {
+    cfg = {
         "vits": {"encoder":"vits","features":64,"out_channels":[48,96,192,384]},
         "vitb": {"encoder":"vitb","features":128,"out_channels":[96,192,384,768]},
         "vitl": {"encoder":"vitl","features":256,"out_channels":[256,512,1024,1024]},
-    }
+    }[ENCODER]
     state = torch.load(str(CHECKPOINT), map_location="cpu")
-    model = DepthAnythingV2(**cfgs[ENCODER]); model.load_state_dict(state)
+    model = DepthAnythingV2(**cfg); model.load_state_dict(state)
     _da2 = model.to(_device).eval()
 
 def _resize(pil, max_side):
@@ -51,9 +53,9 @@ def _resize(pil, max_side):
 def _run_depth(pil_img):
     _load_da2()
     img = _resize(pil_img.convert("RGB"), MAX_SIDE)
-    arr = np.array(img)[:, :, ::-1].copy()  # RGB->BGR
+    arr = np.array(img)[:, :, ::-1].copy()    # RGB->BGR
     try:
-        depth = _da2.infer_image(arr)       # HxW float
+        depth = _da2.infer_image(arr)         # HxW float
     except AttributeError:
         x = torch.from_numpy(arr).permute(2,0,1).unsqueeze(0).float()/255.0
         with torch.no_grad(): depth = _da2(x.to(_device)).squeeze().cpu().numpy()
@@ -81,11 +83,11 @@ async def infer_depth_local(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(400, f"Invalid image: {e}")
     try:
-        t0 = time.time(); depth = _run_depth(img); ms = round((time.time()-t0)*1000,2)
-        H,W = depth.shape; sh=max(1,H//64); sw=max(1,W//64)
+        t0 = time.time(); d = _run_depth(img); ms = round((time.time()-t0)*1000,2)
+        H,W = d.shape; sh=max(1,H//64); sw=max(1,W//64)
         return {"status":"ok","inference_time_ms":ms,
-                "depth_summary":{"H":H,"W":W,"min":float(depth.min()),
-                                 "max":float(depth.max()),"median":float(np.median(depth)),
-                                 "grid_shape": depth[::sh,::sw].shape}}
+                "depth_summary":{"H":H,"W":W,"min":float(d.min()),
+                                 "max":float(d.max()),"median":float(np.median(d)),
+                                 "grid_shape": d[::sh,::sw].shape}}
     except Exception as e:
         traceback.print_exc(); raise HTTPException(500, f"{type(e).__name__}: {e}")
